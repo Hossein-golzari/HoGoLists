@@ -1,0 +1,220 @@
+"""
+Report generation: JSON, Markdown, and CSV output.
+
+All functions are pure — they accept data objects and return strings
+(or write to files), making them easy to test without mocking.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from .dedup import count_by_risk
+from .models import ContractAnalysis, Finding, RiskLevel, ScanReport
+
+
+# ---------------------------------------------------------------------------
+# JSON
+# ---------------------------------------------------------------------------
+
+def to_json(report: ScanReport, indent: int = 2) -> str:
+    """Serialise the full scan report to a JSON string."""
+    return json.dumps(report.to_dict(), indent=indent, default=str)
+
+
+def to_json_file(report: ScanReport, path: str, indent: int = 2) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(to_json(report, indent=indent))
+
+
+# ---------------------------------------------------------------------------
+# Markdown
+# ---------------------------------------------------------------------------
+
+_RISK_EMOJI = {
+    RiskLevel.HIGH: "🔴",
+    RiskLevel.MEDIUM: "🟡",
+    RiskLevel.LOW: "🟢",
+}
+
+_RISK_BADGE = {
+    RiskLevel.HIGH: "**HIGH**",
+    RiskLevel.MEDIUM: "**MEDIUM**",
+    RiskLevel.LOW: "LOW",
+}
+
+
+def _finding_table(findings: List[Finding]) -> str:
+    if not findings:
+        return "_No findings._\n"
+
+    lines = [
+        "| Risk | Name / Selector | Heuristic | Explanation |",
+        "|------|----------------|-----------|-------------|",
+    ]
+    for f in findings:
+        risk_str = f"{_RISK_EMOJI.get(f.risk_level, '')} {_RISK_BADGE.get(f.risk_level, f.risk_level)}"
+        name_str = f"`{f.name}`" if f.name else f"`{f.selector}`"
+        reason = f.heuristic_reason.replace("|", "\\|")
+        explanation = f.explanation[:120].replace("|", "\\|")
+        if len(f.explanation) > 120:
+            explanation += "…"
+        lines.append(f"| {risk_str} | {name_str} | {reason} | {explanation} |")
+    return "\n".join(lines) + "\n"
+
+
+def _contract_section(analysis: ContractAnalysis) -> str:
+    chunks: List[str] = []
+    chunks.append(f"### `{analysis.address}`\n")
+
+    # Metadata row
+    status = "EOA" if analysis.is_eoa else "Contract"
+    if analysis.error:
+        status += f" ⚠ Error: {analysis.error}"
+    chunks.append(f"- **Status**: {status}")
+    chunks.append(f"- **Chain**: {analysis.chain_id}")
+    if analysis.block_number:
+        chunks.append(f"- **Block**: {analysis.block_number}")
+    if analysis.proxy_info and analysis.proxy_info.is_proxy:
+        pi = analysis.proxy_info
+        chunks.append(f"- **Proxy**: {pi.proxy_type or 'yes'}")
+        if pi.implementation_address:
+            chunks.append(f"- **Implementation**: `{pi.implementation_address}`")
+        if pi.beacon_address:
+            chunks.append(f"- **Beacon**: `{pi.beacon_address}`")
+    chunks.append(f"- **Selectors found**: {len(analysis.selectors)}")
+    chunks.append(f"- **Analysis time**: {analysis.duration_ms:.0f} ms")
+    chunks.append("")
+
+    if analysis.is_eoa or analysis.error:
+        chunks.append("")
+        return "\n".join(chunks)
+
+    # Findings
+    counts = count_by_risk(analysis.findings)
+    chunks.append(
+        f"**Findings**: {counts[RiskLevel.HIGH]} high · "
+        f"{counts[RiskLevel.MEDIUM]} medium · "
+        f"{counts[RiskLevel.LOW]} low\n"
+    )
+    chunks.append(_finding_table(analysis.findings))
+    chunks.append("")
+    return "\n".join(chunks)
+
+
+def to_markdown(report: ScanReport) -> str:
+    """Generate a Markdown report for a complete scan."""
+    parts: List[str] = []
+
+    parts.append("# Smart Contract View/Getter Leakage Report\n")
+
+    # Summary
+    parts.append("## Summary\n")
+    parts.append(f"| Field | Value |")
+    parts.append(f"|-------|-------|")
+    parts.append(f"| Chain ID | {report.chain_id} |")
+    parts.append(f"| RPC | `{report.rpc_url}` |")
+    if report.block_number:
+        parts.append(f"| Block | {report.block_number} |")
+    parts.append(f"| Contracts scanned | {report.total_contracts} |")
+    parts.append(f"| Analysed | {report.analyzed} |")
+    parts.append(f"| EOAs skipped | {report.eoas_skipped} |")
+    parts.append(f"| Errors | {report.errors} |")
+    parts.append(f"| Total findings | {report.total_findings} |")
+    parts.append(f"| 🔴 High | {report.high_findings} |")
+    parts.append(f"| 🟡 Medium | {report.medium_findings} |")
+    parts.append(f"| 🟢 Low | {report.low_findings} |")
+    parts.append(f"| Started | {report.started_at} |")
+    parts.append(f"| Finished | {report.finished_at} |")
+    parts.append("")
+
+    # Per-contract sections
+    parts.append("## Results\n")
+    for analysis in report.results:
+        parts.append(_contract_section(analysis))
+
+    # Disclaimer
+    parts.append("---")
+    parts.append(
+        "_This report was generated by the Contract Leakage Detector for **defensive review only**._  "
+        "_Findings indicate potential information exposure, not confirmed exploitability._  "
+        "_Always verify manually before drawing conclusions._"
+    )
+    parts.append("")
+
+    return "\n".join(parts)
+
+
+def to_markdown_file(report: ScanReport, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(to_markdown(report))
+
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+
+_CSV_FIELDS = [
+    "contract_address",
+    "proxy_address",
+    "implementation_address",
+    "name",
+    "selector",
+    "visibility",
+    "type_info",
+    "risk_level",
+    "heuristic_reason",
+    "explanation",
+    "source",
+]
+
+
+def to_csv(report: ScanReport) -> str:
+    """Generate a flat CSV of all findings across all contracts."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for analysis in report.results:
+        for finding in analysis.findings:
+            writer.writerow(finding.to_dict())
+    return buf.getvalue()
+
+
+def to_csv_file(report: ScanReport, path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        fh.write(to_csv(report))
+
+
+# ---------------------------------------------------------------------------
+# Console summary
+# ---------------------------------------------------------------------------
+
+def console_summary(report: ScanReport) -> str:
+    """Short human-readable summary for the terminal."""
+    lines = [
+        f"Scan complete — chain {report.chain_id}",
+        f"  Contracts : {report.total_contracts}  ({report.eoas_skipped} EOAs, {report.errors} errors)",
+        f"  Findings  : {report.total_findings}  "
+        f"({report.high_findings} HIGH / {report.medium_findings} MEDIUM / {report.low_findings} LOW)",
+    ]
+    # Highlight high-risk findings
+    high_items = [
+        f
+        for r in report.results
+        for f in r.findings
+        if f.risk_level == RiskLevel.HIGH
+    ]
+    if high_items:
+        lines.append("")
+        lines.append("  HIGH-risk findings:")
+        for f in high_items[:20]:
+            addr = f.implementation_address or f.contract_address
+            name = f.name or f.selector or "unknown"
+            lines.append(f"    [{addr}] {name} — {f.heuristic_reason}")
+        if len(high_items) > 20:
+            lines.append(f"    … and {len(high_items) - 20} more")
+    return "\n".join(lines)

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "contract-leakage-detector"
+version = "0.1.0"
+description = "Defensive view/getter leakage scanner for EVM smart contracts"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "click>=8.1.0",
+]
+
+[project.optional-dependencies]
+keccak = [
+    # Enables runtime keccak-256 computation for selector verification.
+    # Not required for core scanning — the bundled selector DB is pre-computed.
+    "pycryptodome>=3.19.0",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+cld = "contract_leakage_detector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["contract_leakage_detector*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["contract_leakage_detector/tests"]
